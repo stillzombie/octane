@@ -1,215 +1,131 @@
 <?php
 
-namespace Laravel\Octane\Commands\Concerns;
+namespace App\Http\Livewire\Translation;
 
-use Illuminate\Support\Str;
-use Laravel\Octane\Exceptions\DdException;
-use Laravel\Octane\Exceptions\ServerShutdownException;
-use Laravel\Octane\Exceptions\WorkerException;
-use Laravel\Octane\WorkerExceptionInspector;
-use NunoMaduro\Collision\Writer;
-use Symfony\Component\VarDumper\VarDumper;
+use App\Models\Application;
+use App\Models\Locale;
+use App\Models\Tenant;
+use Livewire\Component;
+use App\Models\Translation;
+use App\Models\TranslationKey;
+use phpDocumentor\Reflection\DocBlock\Tags\Var_;
 
-trait InteractsWithIO
+class Store extends Component
 {
-    use InteractsWithTerminal;
-
-    /**
-     * A list of error messages that should be ignored.
-     *
-     * @var array
-     */
-    protected $ignoreErrors = [
-        'stop signal received, grace timeout is: ',
-        'exit forced',
+    public Locale $locale;
+    public $translations = [];
+    public $tenants = [];
+    public $translationKeys;
+    public $domains;
+    public $filter = '';
+    public $filters = [
+        'search' => '',
     ];
 
-    /**
-     * Write a string as information output.
-     *
-     * @param  string  $string
-     * @param  int|string|null  $verbosity
-     * @return void
-     */
-    public function info($string, $verbosity = null)
+    protected $rules = [
+        'translations.*' => 'sometimes',
+        'tenants.*' => 'sometimes',
+        'locale.locale' => 'required',
+    ];
+
+    public function mount(Locale $locale)
     {
-        $this->label($string, $verbosity, 'INFO', 'cyan', 'black');
-    }
-
-    /**
-     * Write a string as error output.
-     *
-     * @param  string  $string
-     * @param  int|string|null  $verbosity
-     * @return void
-     */
-    public function error($string, $verbosity = null)
-    {
-        if (! Str::contains($string, $this->ignoreErrors)) {
-            $this->label($string, $verbosity, 'ERROR', 'red', 'white');
-        }
-    }
-
-    /**
-     * Write a string as warning output.
-     *
-     * @param  string  $string
-     * @param  int|string|null  $verbosity
-     * @return void
-     */
-    public function warn($string, $verbosity = null)
-    {
-        $this->label($string, $verbosity, 'WARN', 'yellow', 'black');
-    }
-
-    /**
-     * Write a string as label output.
-     *
-     * @param  string  $string
-     * @param  int|string|null  $verbosity
-     * @param  string  $level
-     * @param  string  $background
-     * @param  string  $foreground
-     * @return void
-     */
-    public function label($string, $verbosity, $level, $background, $foreground)
-    {
-        if (! empty($string)) {
-            $this->output->writeln([
-                '',
-                "  <bg=$background;fg=$foreground;options=bold> $level </> $string",
-            ], $this->parseVerbosity($verbosity));
-        }
-    }
-
-    /**
-     * Write information about a request to the console.
-     *
-     * @param  array  $request
-     * @param  int|string|null  $verbosity
-     * @return void
-     */
-    public function requestInfo($request, $verbosity = null)
-    {
-        $terminalWidth = $this->getTerminalWidth();
-
-        $url = parse_url($request['url'], PHP_URL_PATH) ?: '/';
-
-        $duration = number_format(round($request['duration'], 2), 2, '.', '');
-
-        ['method' => $method, 'statusCode' => $statusCode] = $request;
-
-        $dots = str_repeat('.', max($terminalWidth - strlen($method.$url.$duration) - 16, 0));
-
-        if (empty($dots) && ! $this->output->isVerbose()) {
-            $url = substr($url, 0, $terminalWidth - strlen($method.$duration) - 15 - 3).'...';
-        } else {
-            $dots .= ' ';
+        $this->translationKeys = TranslationKey::get();
+        $this->domains = $this->translationKeys->pluck('domain')->unique()->toArray();
+        if(! $locale->id ) {
+            $this->locale = Locale::make([
+                'locale' => ''
+            ]);
+            return;
         }
 
-        $this->output->writeln(sprintf(
-           '  <fg=%s;options=bold>%s </>   <fg=cyan;options=bold>%s</> <options=bold>%s</><fg=#6C7280> %s%s ms</>',
-            match (true) {
-                $statusCode >= 500 => 'red',
-                $statusCode >= 400 => 'yellow',
-                $statusCode >= 300 => 'cyan',
-                $statusCode >= 100 => 'green',
-                default => 'white',
-            },
-           $statusCode,
-           $method,
-           $url,
-           $dots,
-           $duration,
-        ), $this->parseVerbosity($verbosity));
+        $this->tenants = Tenant::get()->mapWithKeys(function($tenant){
+            return [$tenant->id => $this->locale->tenants()->pluck('id')->intersect([$tenant->id])->count() ];
+        });
+
+        $this->translations = $this->locale->translations()->get()->mapWithKeys(function($translation){
+            return [$translation->key_id => $translation->value];
+        })->toArray();
+
     }
 
-    /**
-     * Write information about a dd to the console.
-     *
-     * @param  array  $throwable
-     * @param  int|string|null  $verbosity
-     * @return void
-     */
-    public function ddInfo($throwable, $verbosity = null)
+    public function save()
     {
-        collect(json_decode($throwable['message'], true))
-            ->each(fn ($var) => VarDumper::dump($var));
-    }
-
-    /**
-     * Write information about a throwable to the console.
-     *
-     * @param  array  $throwable
-     * @param  int|string|null  $verbosity
-     * @return void
-     */
-    public function throwableInfo($throwable, $verbosity = null)
-    {
-        if ($throwable['class'] == DdException::class) {
-            return $this->ddInfo($throwable, $verbosity);
+        $this->validate();
+        $prefilled = collect();
+        if(! $this->locale->exists) {
+            $prefilled = $this->prefilldashboard(collect([
+                'validation.required'=> 'The :attribute field is required.',
+                'validation.numeric'=> 'The :attribute must be a number.',
+                'validation.min.string'=> 'The :attribute must be at least :min characters.',
+                'validation.max.string'=> 'The :attribute may not be greater than :max characters.',
+                'validation.email'=> 'The :attribute must be a valid email address.',
+                'validation.unique'=> 'The :attribute has already been taken.',
+                'validation.gt.numeric'=> 'The :attribute must be greater than :value.'
+            ]));
         }
 
-        if (! class_exists('NunoMaduro\Collision\Writer')) {
-            $this->label($throwable['message'], $verbosity, $throwable['class'], 'red', 'white');
+        $this->locale->save();
+        $this->locale->fresh();
+        $localeId = $this->locale->id;
+        $prefilled->each(function($translation) use($localeId) {
+            $translation->locale_id = $localeId;
+            $translation->save();
+        });
 
-            $this->newLine();
+        list($attached, $detached) = Tenant::get()->partition(function ($tenant) {
+            return collect($this->tenants)->filter()->has($tenant->id);
+        });
 
-            $outputTrace = function ($trace, $number) {
-                $number++;
+        Application::whereIn('tenant_id', $detached->pluck('id')->toArray() )->update(['locale_id' => null]);
 
-                ['line' => $line, 'file' => $file] = $trace;
-
-                $this->line("  <fg=yellow>$number</>   $file:$line");
-            };
-
-            $outputTrace($throwable, -1);
-
-            return collect($throwable['trace'])->each($outputTrace);
-        }
-
-        (new Writer(null, $this->output))->write(
-            new WorkerExceptionInspector(
-                new WorkerException(
-                    $throwable['message'],
-                    (int) $throwable['code'],
-                    $throwable['file'],
-                    (int) $throwable['line'],
-                ),
-                $throwable['class'],
-                $throwable['trace'],
-            ),
+        $this->locale->tenants()->sync(
+            collect($this->tenants)->filter()->keys()->toArray()
         );
+
+        collect($this->translations)->each(function ($item, $key) {
+            $translationKey = TranslationKey::where('id', '=', $key)->first();
+
+            Translation::updateOrCreate(
+                [
+                    'locale_id' => $this->locale->id,
+                    'key_id' => $translationKey->id,
+                    'domain' => $translationKey->domain,
+                    'key' =>  $translationKey->key,
+                ],
+                [
+                    'value' => $item
+                ]
+            );
+        });
+
+        return redirect()->to('translations');
     }
 
-    /**
-     * Write information about a "shutdown" throwable to the console.
-     *
-     * @param  array  $throwable
-     * @param  int|string|null  $verbosity
-     * @return void
-     */
-    public function shutdownInfo($throwable, $verbosity = null)
+    protected function prefilldashboard($translations)
     {
-        $this->throwableInfo($throwable, $verbosity);
+        return $translations->map(function($translation, $key) {
+            $translationKey = TranslationKey::where('key', '=', $key)->first();
 
-        throw new ServerShutdownException;
+            return Translation::make(
+                [
+                    'key_id' => $translationKey->id,
+                    'domain' => $translationKey->domain,
+                    'key' =>  $translationKey->key,
+                    'value' => $translation
+                ]
+            );
+        });
     }
 
-    /**
-     * Handle stream information from the worker.
-     *
-     * @param  array  $stream
-     * @param  int|string|null  $verbosity
-     * @return void
-     */
-    public function handleStream($stream, $verbosity = null)
+    public function render()
     {
-        match ($stream['type']) {
-            'request' => $this->requestInfo($stream, $verbosity),
-            'throwable' => $this->throwableInfo($stream, $verbosity),
-            'shutdown' => $this->shutdownInfo($stream, $verbosity),
-            default => $this->info(json_encode($stream, $verbosity))
-        };
+        return view('livewire.translation.store', [
+            'keys' => TranslationKey::
+            when($this->filters['search'], function($query, $search){
+                $query->where('key', 'like', '%'.$search.'%');
+            })
+            ->when($this->filter, fn ($query, $filter) => $query->where('domain', $filter))->get()
+        ])->layout('components.layout');
     }
 }
